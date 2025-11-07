@@ -1,0 +1,163 @@
+use std::env;
+use std::time::Duration;
+use std::thread::sleep;
+use reqwest::blocking::Client;
+use serde_json::json;
+use csv::ReaderBuilder;
+use dotenvy::dotenv;
+use std::error::Error;
+
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("Fatal error: {}", e);
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn Error>> {
+    dotenv().ok();
+
+    // ===== 1️⃣ Load environment variables =====
+    let influx_url = env::var("INFLUX_URL")?;
+    let influx_token = env::var("INFLUX_TOKEN")?;
+    let influx_org = env::var("INFLUX_ORG")?;
+    let influx_bucket = env::var("INFLUX_BUCKET")?;
+    let device_tag = env::var("DEVICE_TAG").unwrap_or_else(|_| "ESP32".to_string());
+
+    let tb_url = env::var("THINGSBOARD_URL")?;
+    let tb_token = env::var("THINGSBOARD_TOKEN")?;
+
+    let poll_interval_secs: u64 = env::var("POLL_INTERVAL_SECONDS")
+        .unwrap_or_else(|_| "5".to_string())
+        .parse()
+        .unwrap_or(5);
+
+    // ===== 2️⃣ Build HTTP client =====
+    let client = Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()?;
+
+    println!(
+        "🚀 Starting Influx → ThingsBoard forwarder (poll every {}s)...",
+        poll_interval_secs
+    );
+
+    let mut last_sent_temp: Option<f64> = None;
+    let mut last_sent_hum: Option<f64> = None;
+
+    // ===== 3️⃣ Main loop =====
+    loop {
+        // Flux query (FIXED)
+        let flux = format!(
+            r#"from(bucket: "{bucket}")
+  |> range(start: -5m)
+  |> filter(fn: (r) => r["_measurement"] == "sensor_data")
+  |> filter(fn: (r) => r["device"] == "{device}")
+  |> filter(fn: (r) => r["_field"] == "temperature" or r["_field"] == "humidity")
+  |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+  |> sort(columns: ["_time"], desc: true)
+  |> limit(n: 1)"#,
+            bucket = influx_bucket,
+            device = device_tag
+        );
+
+        let influx_query_url = format!(
+            "{}/api/v2/query?org={}",
+            influx_url.trim_end_matches('/'),
+            influx_org
+        );
+
+        println!("🧠 Querying InfluxDB → {}", influx_query_url);
+
+        let resp_result = client
+            .post(&influx_query_url)
+            .header("Authorization", format!("Token {}", influx_token))
+            .header("Accept", "application/csv")
+            .header("Content-Type", "application/vnd.flux")
+            .body(flux)
+            .send();
+
+        match resp_result {
+            Ok(r) => {
+                let status = r.status();
+                let text_body = r.text().unwrap_or_default();
+
+                if !status.is_success() {
+                    eprintln!("❌ Influx query failed ({}):\n{}", status, text_body);
+                } else {
+                    // Parse CSV hasil query
+                    let mut rdr = ReaderBuilder::new().has_headers(true).from_reader(text_body.as_bytes());
+                    let headers = rdr.headers()?.clone();
+
+                    // Cari indeks kolom
+                    let temp_idx = headers.iter().position(|h| h == "temperature");
+                    let hum_idx = headers.iter().position(|h| h == "humidity");
+
+                    if temp_idx.is_none() || hum_idx.is_none() {
+                        println!("⚠️ Kolom temperature/humidity tidak ditemukan (mungkin belum ada data baru).");
+                    } else {
+                        let mut sent = false;
+
+                        for result in rdr.records() {
+                            let record = result?;
+                            let temp_val = temp_idx
+                                .and_then(|i| record.get(i))
+                                .and_then(|s| s.parse::<f64>().ok());
+                            let hum_val = hum_idx
+                                .and_then(|i| record.get(i))
+                                .and_then(|s| s.parse::<f64>().ok());
+
+                            if let (Some(t), Some(h)) = (temp_val, hum_val) {
+                                println!("📊 Data terakhir dari Influx → Temp: {:.2} °C | Hum: {:.2} %", t, h);
+
+                                let should_send = match (last_sent_temp, last_sent_hum) {
+                                    (Some(lt), Some(lh)) => (lt - t).abs() > 0.0001 || (lh - h).abs() > 0.0001,
+                                    _ => true,
+                                };
+
+                                if should_send {
+                                    let tb_endpoint = format!(
+                                        "{}/api/v1/{}/telemetry",
+                                        tb_url.trim_end_matches('/'),
+                                        tb_token
+                                    );
+                                    let payload = json!({ "temperature": t, "humidity": h });
+
+                                    println!("📤 Mengirim ke ThingsBoard → {}", tb_endpoint);
+
+                                    let tb_resp = client.post(&tb_endpoint).json(&payload).send();
+
+                                    match tb_resp {
+                                        Ok(resp2) => {
+                                            if resp2.status().is_success() {
+                                                println!("✅ Data berhasil dikirim ke ThingsBoard!");
+                                            } else {
+                                                eprintln!("⚠️ ThingsBoard balas {}.", resp2.status());
+                                            }
+                                        }
+                                        Err(e) => eprintln!("❌ Gagal kirim ke ThingsBoard: {}", e),
+                                    }
+
+                                    last_sent_temp = Some(t);
+                                    last_sent_hum = Some(h);
+                                } else {
+                                    println!("⏩ Tidak ada perubahan data, skip kirim.");
+                                }
+
+                                sent = true;
+                                break;
+                            }
+                        }
+
+                        if !sent {
+                            println!("⚠️ Tidak ada baris data terbaca dari hasil query.");
+                        }
+                    }
+                }
+            }
+            Err(e) => eprintln!("❌ Gagal kirim query ke InfluxDB: {}", e),
+        }
+
+        sleep(Duration::from_secs(poll_interval_secs));
+    }
+}
