@@ -1,0 +1,72 @@
+use esp_idf_hal::delay::FreeRtos;
+use esp_idf_hal::gpio::*;
+use esp_idf_hal::i2c::*;
+use esp_idf_hal::prelude::*;
+use std::thread;
+use std::time::Duration;
+
+// Alamat I2C default SHT20
+const SHT20_ADDR: u8 = 0x40;
+
+// Perintah SHT20
+const CMD_MEASURE_TEMP: u8 = 0xF3;
+const CMD_MEASURE_HUM: u8 = 0xF5;
+
+fn main() {
+    esp_idf_sys::link_patches();
+
+    // Inisialisasi peripherals
+    let peripherals = Peripherals::take().unwrap();
+    let pins = peripherals.pins;
+
+    // Inisialisasi I2C (gunakan pin sesuai board kamu)
+    let i2c = I2cDriver::new(
+        peripherals.i2c0,
+        pins.gpio8,  // SDA
+        pins.gpio9,  // SCL
+        &I2cConfig::new().baudrate(100.kHz().into()),
+    )?;
+
+    // Inisialisasi pin pompa (aktif tinggi)
+    let mut pump = PinDriver::output(pins.gpio4)?;
+
+    println!("🚀 Sistem mulai: SHT20 + Pompa terhubung!");
+
+    loop {
+        let temperature = read_temperature(&i2c)?;
+        let humidity = read_humidity(&i2c)?;
+
+        println!("🌡️ Suhu: {:.2} °C | 💧 Kelembapan: {:.2} %", temperature, humidity);
+
+        // Logika kontrol pompa
+        if humidity < 60.0 {
+            pump.set_high()?; // nyalakan pompa
+            println!("💦 Pompa aktif (kelembapan rendah)");
+        } else {
+            pump.set_low()?; // matikan pompa
+            println!("⛔ Pompa mati (kelembapan cukup)");
+        }
+
+        thread::sleep(Duration::from_secs(5));
+    }
+}
+
+fn read_temperature(i2c: &I2cDriver) -> Result<f32> {
+    i2c.write(SHT20_ADDR, &[CMD_MEASURE_TEMP])?;
+    FreeRtos::delay_ms(100);
+
+    let mut data = [0u8; 2];
+    i2c.read(SHT20_ADDR, &mut data)?;
+    let raw = ((data[0] as u16) << 8) | (data[1] as u16);
+    Ok(-46.85 + 175.72 * (raw as f32 / 65536.0))
+}
+
+fn read_humidity(i2c: &I2cDriver) -> Result<f32> {
+    i2c.write(SHT20_ADDR, &[CMD_MEASURE_HUM])?;
+    FreeRtos::delay_ms(100);
+
+    let mut data = [0u8; 2];
+    i2c.read(SHT20_ADDR, &mut data)?;
+    let raw = ((data[0] as u16) << 8) | (data[1] as u16);
+    Ok(-6.0 + 125.0 * (raw as f32 / 65536.0))
+}
